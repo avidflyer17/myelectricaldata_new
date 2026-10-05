@@ -394,7 +394,7 @@ class MQTTExporter(BaseExporter):
 
     async def _get_tempo_data(self, db: AsyncSession) -> dict[str, Any] | None:
         """Get Tempo data"""
-        from ...models.tempo import TempoDay
+        from ...models.tempo_day import TempoDay
 
         today = date.today()
         tomorrow = today + timedelta(days=1)
@@ -447,15 +447,15 @@ class MQTTExporter(BaseExporter):
 
     async def _get_ecowatt_data(self, db: AsyncSession) -> dict[str, Any] | None:
         """Get EcoWatt data"""
-        from ...models.ecowatt import EcoWattSignal
+        from ...models.ecowatt import EcoWatt
 
         today = date.today()
         now = datetime.now()
 
         # Get today's signal
-        stmt = select(EcoWattSignal).where(
-            cast(EcoWattSignal.timestamp, String).like(f"{today.isoformat()}%")
-        ).order_by(EcoWattSignal.timestamp.desc()).limit(1)
+        stmt = select(EcoWatt).where(
+            func.date(EcoWatt.periode) == today
+        ).order_by(EcoWatt.generation_datetime.desc()).limit(1)
         result = await db.execute(stmt)
         signal = result.scalar_one_or_none()
 
@@ -463,18 +463,20 @@ class MQTTExporter(BaseExporter):
             return None
 
         # Parse hourly values if available
-        hourly_values = signal.hourly_values or []
-        current_level = signal.level
+        hourly_values = signal.values or []
+        current_level = signal.dvalue
         current_hour = now.hour
 
         # Get current hour level if available
         if hourly_values and len(hourly_values) > current_hour:
-            current_level = hourly_values[current_hour]
+            val = hourly_values[current_hour]
+            current_level = val.get("value", val) if isinstance(val, dict) else val
 
         # Get next hour level
         next_hour_level = None
         if hourly_values and len(hourly_values) > current_hour + 1:
-            next_hour_level = hourly_values[current_hour + 1]
+            val = hourly_values[current_hour + 1]
+            next_hour_level = val.get("value", val) if isinstance(val, dict) else val
 
         return {
             "date": today.isoformat(),
