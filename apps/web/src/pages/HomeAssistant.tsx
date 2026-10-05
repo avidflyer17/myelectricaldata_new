@@ -274,6 +274,23 @@ function getPdlEntities(pdl: string): BaseEntity[] {
       device_class: 'energy',
       description: 'Total production des 30 derniers jours',
     },
+    {
+      entity_id: `sensor.myelectricaldata_linky_${pdl}_max_power`,
+      name: `Puissance max ${pdl}`,
+      device: `Linky ${pdl}`,
+      icon: 'mdi:gauge',
+      unit: 'VA',
+      device_class: 'apparent_power',
+      description: 'Puissance maximale quotidienne atteinte (avec kVA, taux de charge et historique 31j en attributs)',
+    },
+    {
+      entity_id: `binary_sensor.myelectricaldata_linky_${pdl}_max_power_over`,
+      name: `Dépassement puissance ${pdl}`,
+      device: `Linky ${pdl}`,
+      icon: 'mdi:flash-alert',
+      device_class: 'problem',
+      description: 'Alerte si la puissance maximale dépasse la puissance souscrite du contrat',
+    },
   ]
 }
 

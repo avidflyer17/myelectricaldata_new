@@ -115,6 +115,37 @@ class ProductionData(Base, TimestampMixin):
         return f"<ProductionData({self.usage_point_id}, {self.date}, {self.granularity.value}, {self.value}Wh)>"
 
 
+class MaxPowerData(Base, TimestampMixin):
+    """Store daily maximum power data from MyElectricalData API / Enedis
+
+    Stores daily peak apparent power (in VA) reached on the Linky meter,
+    with the timestamp/time of when the peak occurred.
+    """
+
+    __tablename__ = "max_power_data"
+    __table_args__ = (
+        UniqueConstraint("usage_point_id", "date", name="uq_max_power_data"),
+        Index("ix_max_power_usage_point_date", "usage_point_id", "date"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    usage_point_id: Mapped[str] = mapped_column(String(14), nullable=False, index=True)
+    date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+
+    # Maximum apparent power in VA
+    value: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # Event time when peak occurred (e.g., "13:03:35" or full ISO datetime)
+    event_time: Mapped[str | None] = mapped_column(String(25), nullable=True)
+
+    # Source metadata
+    source: Mapped[str] = mapped_column(String(50), default="myelectricaldata")
+    raw_data: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+
+    def __repr__(self) -> str:
+        return f"<MaxPowerData({self.usage_point_id}, {self.date}, {self.value}VA)>"
+
+
 class SyncStatusType(str, enum.Enum):
     """Sync operation status"""
 
