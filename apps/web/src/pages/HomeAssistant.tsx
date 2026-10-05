@@ -598,11 +598,11 @@ export default function HomeAssistant() {
           // Ne traiter que les messages "state" pour les valeurs
           if (m.msg_type !== 'state') return
 
-          const entityId = m.entity
-            ? `sensor.${m.entity}`
-            : m.topic
-              ? `sensor.${m.topic.replace(/\//g, '_')}`
-              : null
+          const raw = m.entity || (m.topic ? m.topic.replace(/\//g, '_') : null)
+          const domain = m.topic?.includes('/binary_sensor/') ? 'binary_sensor' : 'sensor'
+          const entityId = raw
+            ? (raw.startsWith('sensor.') || raw.startsWith('binary_sensor.') ? raw : `${domain}.${raw}`)
+            : null
           if (entityId && m.state !== undefined) {
             newValues[entityId] = String(m.state)
           }
@@ -634,11 +634,11 @@ export default function HomeAssistant() {
         // Chercher le message "state" correspondant à cette entité
         const metric = response.data.metrics.find((m) => {
           if (m.msg_type !== 'state') return false
-          const metricEntityId = m.entity
-            ? `sensor.${m.entity}`
-            : m.topic
-              ? `sensor.${m.topic.replace(/\//g, '_')}`
-              : null
+          const raw = m.entity || (m.topic ? m.topic.replace(/\//g, '_') : null)
+          const domain = m.topic?.includes('/binary_sensor/') ? 'binary_sensor' : 'sensor'
+          const metricEntityId = raw
+            ? (raw.startsWith('sensor.') || raw.startsWith('binary_sensor.') ? raw : `${domain}.${raw}`)
+            : null
           return metricEntityId === entityId
         })
         if (metric && metric.state !== undefined) {

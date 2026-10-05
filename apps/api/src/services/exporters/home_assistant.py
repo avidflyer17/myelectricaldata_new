@@ -427,6 +427,12 @@ class HomeAssistantExporter(BaseExporter):
                         results["consumption"] += count
                         results["linky_card"] += count
 
+                        # Statistiques de consommation agrégées (7j, 14j, 30j)
+                        count_c_stats = await self._export_consumption_stats(
+                            client, stats, pdl, include_main=False
+                        )
+                        results["consumption"] += count_c_stats
+
                         # Capteurs HP/HC (contrats à heures creuses)
                         results["consumption"] += await self._export_hp_hc_sensors(client, db, pdl)
 
@@ -440,6 +446,12 @@ class HomeAssistantExporter(BaseExporter):
                         )
                         results["production"] += count
                         results["linky_card"] += count
+
+                        # Statistiques de production agrégées (7j, 14j, 30j)
+                        count_p_stats = await self._export_production_stats(
+                            client, stats, pdl, include_main=False
+                        )
+                        results["production"] += count_p_stats
 
                     except Exception as e:
                         logger.error(f"[HA-MQTT] Export failed for PDL {pdl}: {e}")
@@ -577,6 +589,11 @@ class HomeAssistantExporter(BaseExporter):
                         count_c = await self._export_linky_card_stats(client, stats, db, pdl, "consumption")
                         results["consumption"] += count_c
                         results["linky_card"] += count_c
+
+                        count_c_stats = await self._export_consumption_stats(client, stats, pdl, include_main=False)
+                        results["consumption"] += count_c_stats
+                        count_c += count_c_stats
+
                         count_hp_hc = await self._export_hp_hc_sensors(client, db, pdl)
                         results["consumption"] += count_hp_hc
                         count_c += count_hp_hc
@@ -587,6 +604,10 @@ class HomeAssistantExporter(BaseExporter):
                         count_p = await self._export_linky_card_stats(client, stats, db, pdl, "production")
                         results["production"] += count_p
                         results["linky_card"] += count_p
+
+                        count_p_stats = await self._export_production_stats(client, stats, pdl, include_main=False)
+                        results["production"] += count_p_stats
+                        count_p += count_p_stats
 
                         await emit(f"PDL {pdl} exporté ({count_c} conso, {count_mp} pmax, {count_p} prod)")
                     except Exception as e:
@@ -855,6 +876,7 @@ class HomeAssistantExporter(BaseExporter):
         client: aiomqtt.Client,
         stats: Any,
         pdl: str,
+        include_main: bool = True,
     ) -> int:
         """Export consumption statistics for a PDL via MQTT Discovery (old format)
 
@@ -869,38 +891,39 @@ class HomeAssistantExporter(BaseExporter):
         count = 0
         device = self._get_device_linky(pdl)
 
-        # Get yesterday's consumption (most recent complete day)
-        yesterday_wh = await stats.get_day_total(pdl, yesterday, "consumption")
-        yesterday_kwh = round(yesterday_wh / 1000, 2)
+        if include_main:
+            # Get yesterday's consumption (most recent complete day)
+            yesterday_wh = await stats.get_day_total(pdl, yesterday, "consumption")
+            yesterday_kwh = round(yesterday_wh / 1000, 2)
 
-        # Get last N days history for attributes
-        history = {}
-        for i in range(1, 32):  # Last 31 days
-            day = today - timedelta(days=i)
-            day_wh = await stats.get_day_total(pdl, day, "consumption")
-            history[day.isoformat()] = round(day_wh / 1000, 2)
+            # Get last N days history for attributes
+            history = {}
+            for i in range(1, 32):  # Last 31 days
+                day = today - timedelta(days=i)
+                day_wh = await stats.get_day_total(pdl, day, "consumption")
+                history[day.isoformat()] = round(day_wh / 1000, 2)
 
-        # Main consumption sensor with history in attributes
-        await self._publish_sensor_old_format(
-            client,
-            topic=f"myelectricaldata_consumption/{pdl}",
-            name="consumption",
-            unique_id=f"myelectricaldata_linky_{pdl}_consumption",
-            device=device,
-            state=yesterday_kwh,
-            attributes={
-                "pdl": pdl,
-                "date": yesterday.isoformat(),
-                "value_wh": yesterday_wh,
-                "history": history,
-                "last_updated": datetime.now().isoformat(),
-            },
-            unit="kWh",
-            device_class="energy",
-            state_class="total",
-            icon="mdi:lightning-bolt",
-        )
-        count += 1
+            # Main consumption sensor with history in attributes
+            await self._publish_sensor_old_format(
+                client,
+                topic=f"myelectricaldata_consumption/{pdl}",
+                name="consumption",
+                unique_id=f"myelectricaldata_linky_{pdl}_consumption",
+                device=device,
+                state=yesterday_kwh,
+                attributes={
+                    "pdl": pdl,
+                    "date": yesterday.isoformat(),
+                    "value_wh": yesterday_wh,
+                    "history": history,
+                    "last_updated": datetime.now().isoformat(),
+                },
+                unit="kWh",
+                device_class="energy",
+                state_class="total",
+                icon="mdi:lightning-bolt",
+            )
+            count += 1
 
         # Last N days aggregates
         for days_count in [7, 14, 30]:
@@ -1076,6 +1099,7 @@ class HomeAssistantExporter(BaseExporter):
         client: aiomqtt.Client,
         stats: Any,
         pdl: str,
+        include_main: bool = True,
     ) -> int:
         """Export production statistics for a PDL via MQTT Discovery (old format)
 
@@ -1101,38 +1125,39 @@ class HomeAssistantExporter(BaseExporter):
             logger.debug(f"[HA-MQTT] PDL {pdl} has no production, skipping")
             return 0
 
-        # Get yesterday's production (most recent complete day)
-        yesterday_wh = await stats.get_day_total(pdl, yesterday, "production")
-        yesterday_kwh = round(yesterday_wh / 1000, 2)
+        if include_main:
+            # Get yesterday's production (most recent complete day)
+            yesterday_wh = await stats.get_day_total(pdl, yesterday, "production")
+            yesterday_kwh = round(yesterday_wh / 1000, 2)
 
-        # Get last N days history for attributes
-        history = {}
-        for i in range(1, 32):  # Last 31 days
-            day = today - timedelta(days=i)
-            day_wh = await stats.get_day_total(pdl, day, "production")
-            history[day.isoformat()] = round(day_wh / 1000, 2)
+            # Get last N days history for attributes
+            history = {}
+            for i in range(1, 32):  # Last 31 days
+                day = today - timedelta(days=i)
+                day_wh = await stats.get_day_total(pdl, day, "production")
+                history[day.isoformat()] = round(day_wh / 1000, 2)
 
-        # Main production sensor with history in attributes
-        await self._publish_sensor_old_format(
-            client,
-            topic=f"myelectricaldata_production/{pdl}",
-            name="production",
-            unique_id=f"myelectricaldata_linky_{pdl}_production",
-            device=device,
-            state=yesterday_kwh,
-            attributes={
-                "pdl": pdl,
-                "date": yesterday.isoformat(),
-                "value_wh": yesterday_wh,
-                "history": history,
-                "last_updated": datetime.now().isoformat(),
-            },
-            unit="kWh",
-            device_class="energy",
-            state_class="total",
-            icon="mdi:solar-power",
-        )
-        count += 1
+            # Main production sensor with history in attributes
+            await self._publish_sensor_old_format(
+                client,
+                topic=f"myelectricaldata_production/{pdl}",
+                name="production",
+                unique_id=f"myelectricaldata_linky_{pdl}_production",
+                device=device,
+                state=yesterday_kwh,
+                attributes={
+                    "pdl": pdl,
+                    "date": yesterday.isoformat(),
+                    "value_wh": yesterday_wh,
+                    "history": history,
+                    "last_updated": datetime.now().isoformat(),
+                },
+                unit="kWh",
+                device_class="energy",
+                state_class="total",
+                icon="mdi:solar-power",
+            )
+            count += 1
 
         # Last N days aggregates
         for days_count in [7, 14, 30]:
@@ -2063,6 +2088,7 @@ class HomeAssistantExporter(BaseExporter):
             #   - homeassistant/sensor/myelectricaldata_edf/tempo_days_blue/state
             #   - homeassistant/sensor/myelectricaldata_consumption/{pdl}/state
             #   etc.
+            # Topics à lire - on s'abonne aux topics HA Discovery
             topics_to_read = [
                 f"{self.discovery_prefix}/sensor/myelectricaldata_rte/#",
                 f"{self.discovery_prefix}/sensor/myelectricaldata_edf/#",
@@ -2070,12 +2096,23 @@ class HomeAssistantExporter(BaseExporter):
                 f"{self.discovery_prefix}/sensor/myelectricaldata_consumption_last_7_day/#",
                 f"{self.discovery_prefix}/sensor/myelectricaldata_consumption_last_14_day/#",
                 f"{self.discovery_prefix}/sensor/myelectricaldata_consumption_last_30_day/#",
+                f"{self.discovery_prefix}/sensor/myelectricaldata_consumption_yesterday_hp/#",
+                f"{self.discovery_prefix}/sensor/myelectricaldata_consumption_yesterday_hc/#",
+                f"{self.discovery_prefix}/sensor/myelectricaldata_consumption_this_week_hp/#",
+                f"{self.discovery_prefix}/sensor/myelectricaldata_consumption_this_week_hc/#",
+                f"{self.discovery_prefix}/sensor/myelectricaldata_consumption_this_month_hp/#",
+                f"{self.discovery_prefix}/sensor/myelectricaldata_consumption_this_month_hc/#",
+                f"{self.discovery_prefix}/sensor/myelectricaldata_consumption_this_year_hp/#",
+                f"{self.discovery_prefix}/sensor/myelectricaldata_consumption_this_year_hc/#",
                 f"{self.discovery_prefix}/sensor/myelectricaldata_production/#",
                 f"{self.discovery_prefix}/sensor/myelectricaldata_production_last_7_day/#",
                 f"{self.discovery_prefix}/sensor/myelectricaldata_production_last_14_day/#",
                 f"{self.discovery_prefix}/sensor/myelectricaldata_production_last_30_day/#",
+                f"{self.discovery_prefix}/sensor/myelectricaldata_max_power/#",
+                f"{self.discovery_prefix}/binary_sensor/myelectricaldata_max_power_over/#",
                 # Fallback pour le préfixe personnalisé
                 f"{self.discovery_prefix}/sensor/{self.prefix}/#",
+                f"{self.discovery_prefix}/binary_sensor/{self.prefix}/#",
             ]
 
             # Compteur pour détecter quand on a fini de recevoir les messages retained
@@ -2144,19 +2181,20 @@ class HomeAssistantExporter(BaseExporter):
             for topic, value, msg_type, pdl in raw_messages:
                 if msg_type == "config" and isinstance(value, dict):
                     topic_parts = topic.split("/")
+                    domain = topic_parts[1] if len(topic_parts) > 1 and topic_parts[1] in ("sensor", "binary_sensor") else "sensor"
                     topic_base = "/".join(topic_parts[:-1]) if len(topic_parts) > 1 else topic
                     unique_id = value.get("uniq_id") or value.get("unique_id")
                     if unique_id:
-                        topic_to_unique_id[topic_base] = unique_id
+                        full_id = f"{domain}.{unique_id}" if not unique_id.startswith(f"{domain}.") else unique_id
+                        topic_to_unique_id[topic_base] = full_id
 
             # Phase 2 : Traiter tous les messages avec le mapping complet
             for topic, value, msg_type, pdl in raw_messages:
                 topic_parts = topic.split("/")
+                domain = topic_parts[1] if len(topic_parts) > 1 and topic_parts[1] in ("sensor", "binary_sensor") else "sensor"
                 topic_base = "/".join(topic_parts[:-1]) if len(topic_parts) > 1 else topic
 
                 # Construire le nom de l'entité à partir du topic (fallback)
-                # Format: homeassistant/sensor/myelectricaldata_rte/tempo_today/state
-                # On veut: myelectricaldata_rte_tempo_today (avec underscore, pas slash)
                 entity_path = "_".join(topic_parts[2:-1]) if len(topic_parts) > 3 else topic.replace("/", "_")
 
                 if msg_type == "config":
@@ -2187,8 +2225,11 @@ class HomeAssistantExporter(BaseExporter):
                 elif msg_type == "state":
                     # Message d'état - valeur actuelle
                     # Utiliser le unique_id si on l'a trouvé via le config
-                    entity_id = topic_to_unique_id.get(topic_base, entity_path)
+                    fallback_id = f"{domain}.{entity_path}"
+                    entity_id = topic_to_unique_id.get(topic_base, fallback_id)
                     category = self._categorize_ha_topic(topic)
+
+                    state_val = value.get("state") if isinstance(value, dict) and "state" in value else value
 
                     metrics.append({
                         "entity": entity_id,
@@ -2196,7 +2237,7 @@ class HomeAssistantExporter(BaseExporter):
                         "msg_type": "state",
                         "category": category,
                         "pdl": pdl,
-                        "state": value,
+                        "state": state_val,
                     })
                 elif msg_type == "attributes":
                     # Attributs additionnels
@@ -2315,6 +2356,14 @@ class HomeAssistantExporter(BaseExporter):
             return "Prod Période"
         elif "myelectricaldata_production/" in topic_lower:
             return "Prod Journalière"
+
+        # Max power sensors
+        elif "max_power" in topic_lower:
+            return "Puissance Maximale"
+
+        # HP / HC consumption sensors
+        elif "consumption_" in topic_lower and any(t in topic_lower for t in ("_hp", "_hc")):
+            return "Conso HP/HC"
 
         # Legacy format fallback
         parts = topic_lower.split("/")
