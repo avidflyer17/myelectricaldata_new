@@ -28,7 +28,9 @@ from ..services.local_data import (
     LocalDataService,
     format_daily_response,
     format_detail_response,
+    format_max_power_response,
 )
+from ..services.sync import SyncService
 
 logger = logging.getLogger(__name__)
 
@@ -393,16 +395,15 @@ async def get_consumption_detail(
             )
 
 
-@router.get("/consumption/max_power/{usage_point_id}", response_model=APIResponse)
-async def get_max_power(
-    usage_point_id: str = Path(..., description="Point de livraison (14 chiffres)"),
-    start: str = Query(..., description="Date de début (YYYY-MM-DD)"),
-    end: str = Query(..., description="Date de fin (YYYY-MM-DD)"),
-    use_cache: bool = Query(False, description="Use cached data if available (ignored in client mode)"),
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+async def _handle_get_max_power(
+    usage_point_id: str,
+    start: str,
+    end: str,
+    use_cache: bool,
+    current_user: User,
+    db: AsyncSession,
 ) -> APIResponse:
-    """Get daily maximum power data via MyElectricalData gateway"""
+    """Internal handler for daily maximum power data (local-first strategy)"""
     # Verify PDL ownership
     if not await verify_pdl_ownership(usage_point_id, current_user, db):
         return APIResponse(
@@ -414,16 +415,102 @@ async def get_max_power(
         )
 
     try:
-        adapter = get_med_adapter()
-        response = await adapter.get_consumption_max_power(usage_point_id, start, end)
-        data = v5_to_2026(extract_gateway_data(response), grandeur_metier="CONS", grandeur_physique="PMA", pas="P1D")
-        return APIResponse(success=True, data=data)
-    except Exception as e:
-        logger.error(f"[{usage_point_id}] Error fetching max power: {e}")
+        start_date = parse_date(start)
+        end_date = parse_date(end)
+    except ValueError as e:
         return APIResponse(
             success=False,
-            error=ErrorDetail(code="GATEWAY_ERROR", message=str(e)),
+            error=ErrorDetail(code="INVALID_DATE", message=str(e)),
         )
+
+    local_service = LocalDataService(db)
+    all_readings: list[dict] = []
+
+    if use_cache:
+        # Get local data and find missing ranges
+        local_data, missing_ranges = await local_service.get_max_power(
+            usage_point_id, start_date, end_date
+        )
+        all_readings.extend(local_data)
+
+        # If no missing ranges, return local data only
+        if not missing_ranges:
+            logger.info(
+                f"[{usage_point_id}] Daily max power fully served from local cache "
+                f"({len(local_data)} records)"
+            )
+            return APIResponse(
+                success=True,
+                data=format_max_power_response(usage_point_id, start, end, all_readings, from_cache=True),
+            )
+
+        # Fetch only missing ranges from gateway
+        adapter = get_med_adapter()
+        sync_service = SyncService(db)
+        for range_start, range_end in missing_ranges:
+            try:
+                response = await adapter.get_consumption_max_power(
+                    usage_point_id,
+                    range_start.isoformat(),
+                    range_end.isoformat(),
+                )
+                gateway_readings = extract_readings_from_response(response)
+                all_readings.extend(gateway_readings)
+
+                # Store to local database
+                records = sync_service._parse_max_power_reading(response, usage_point_id)
+                if records:
+                    await sync_service._upsert_max_power_records(records)
+
+                logger.info(
+                    f"[{usage_point_id}] Fetched {len(gateway_readings)} max power records from gateway "
+                    f"for range {range_start} to {range_end}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[{usage_point_id}] Failed to fetch max power {range_start} to {range_end}: {e}"
+                )
+
+        # Sort by date
+        all_readings.sort(key=lambda x: x.get("d", ""))
+
+        return APIResponse(
+            success=True,
+            data=format_max_power_response(usage_point_id, start, end, all_readings, from_cache=False),
+        )
+
+    else:
+        # Force fetch from gateway (no cache)
+        try:
+            adapter = get_med_adapter()
+            response = await adapter.get_consumption_max_power(usage_point_id, start, end)
+            data = v5_to_2026(extract_gateway_data(response), grandeur_metier="CONS", grandeur_physique="PMA", pas="P1D")
+            sync_service = SyncService(db)
+            records = sync_service._parse_max_power_reading(response, usage_point_id)
+            if records:
+                await sync_service._upsert_max_power_records(records)
+            logger.info(f"[{usage_point_id}] Daily max power fetched from gateway (cache disabled)")
+            return APIResponse(success=True, data=data)
+        except Exception as e:
+            logger.error(f"[{usage_point_id}] Error fetching max power: {e}")
+            return APIResponse(
+                success=False,
+                error=ErrorDetail(code="GATEWAY_ERROR", message=str(e)),
+            )
+
+
+@router.get("/consumption/max_power/{usage_point_id}", response_model=APIResponse)
+async def get_max_power(
+    usage_point_id: str = Path(..., description="Point de livraison (14 chiffres)"),
+    start: str = Query(..., description="Date de début (YYYY-MM-DD)"),
+    end: str = Query(..., description="Date de fin (YYYY-MM-DD)"),
+    use_cache: bool = Query(True, description="Use local cache and only fetch missing data"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> APIResponse:
+    """Get daily maximum power data via local cache or MyElectricalData gateway"""
+    return await _handle_get_max_power(usage_point_id, start, end, use_cache, current_user, db)
+
 
 
 # =========================================================================
@@ -641,32 +728,13 @@ async def get_power(
     usage_point_id: str = Path(..., description="Point de livraison (14 chiffres)"),
     start: str = Query(..., description="Date de début (YYYY-MM-DD)"),
     end: str = Query(..., description="Date de fin (YYYY-MM-DD)"),
-    use_cache: bool = Query(False, description="Use cached data if available (ignored in client mode)"),
+    use_cache: bool = Query(True, description="Use local cache and only fetch missing data"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> APIResponse:
-    """Get daily maximum power data via MyElectricalData gateway"""
-    # Verify PDL ownership
-    if not await verify_pdl_ownership(usage_point_id, current_user, db):
-        return APIResponse(
-            success=False,
-            error=ErrorDetail(
-                code="ACCESS_DENIED",
-                message="Access denied: PDL not found or does not belong to you.",
-            ),
-        )
+    """Get daily maximum power data via MyElectricalData gateway (alias)"""
+    return await _handle_get_max_power(usage_point_id, start, end, use_cache, current_user, db)
 
-    try:
-        adapter = get_med_adapter()
-        response = await adapter.get_consumption_max_power(usage_point_id, start, end)
-        data = v5_to_2026(extract_gateway_data(response), grandeur_metier="CONS", grandeur_physique="PMA", pas="P1D")
-        return APIResponse(success=True, data=data)
-    except Exception as e:
-        logger.error(f"[{usage_point_id}] Error fetching max power: {e}")
-        return APIResponse(
-            success=False,
-            error=ErrorDetail(code="GATEWAY_ERROR", message=str(e)),
-        )
 
 
 # =========================================================================

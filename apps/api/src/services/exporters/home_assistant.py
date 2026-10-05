@@ -387,6 +387,7 @@ class HomeAssistantExporter(BaseExporter):
             "consumption": 0,
             "production": 0,
             "linky_card": 0,
+            "max_power": 0,
             "tempo": 0,
             "ecowatt": 0,
             "errors": [],
@@ -428,6 +429,10 @@ class HomeAssistantExporter(BaseExporter):
 
                         # Capteurs HP/HC (contrats à heures creuses)
                         results["consumption"] += await self._export_hp_hc_sensors(client, db, pdl)
+
+                        # Capteur puissance max journalière
+                        count_mp = await self._export_max_power_sensor(client, stats, db, pdl)
+                        results["max_power"] += count_mp
 
                         # Sensor production (si applicable)
                         count = await self._export_linky_card_stats(
@@ -519,6 +524,7 @@ class HomeAssistantExporter(BaseExporter):
             "consumption": 0,
             "production": 0,
             "linky_card": 0,
+            "max_power": 0,
             "tempo": 0,
             "ecowatt": 0,
             "errors": [],
@@ -575,11 +581,14 @@ class HomeAssistantExporter(BaseExporter):
                         results["consumption"] += count_hp_hc
                         count_c += count_hp_hc
 
+                        count_mp = await self._export_max_power_sensor(client, stats, db, pdl)
+                        results["max_power"] += count_mp
+
                         count_p = await self._export_linky_card_stats(client, stats, db, pdl, "production")
                         results["production"] += count_p
                         results["linky_card"] += count_p
 
-                        await emit(f"PDL {pdl} exporté ({count_c} conso, {count_p} prod)")
+                        await emit(f"PDL {pdl} exporté ({count_c} conso, {count_mp} pmax, {count_p} prod)")
                     except Exception as e:
                         logger.error(f"[HA-MQTT] Export failed for PDL {pdl}: {e}")
                         results["errors"].append(f"{pdl}: {str(e)}")
@@ -957,6 +966,111 @@ class HomeAssistantExporter(BaseExporter):
             )
         return len(hp_hc)
 
+    async def _export_max_power_sensor(
+        self,
+        client: aiomqtt.Client,
+        stats: Any,
+        db: AsyncSession,
+        pdl: str,
+    ) -> int:
+        """Publie les capteurs de puissance maximale d'un PDL via MQTT Discovery.
+
+        - sensor.myelectricaldata_linky_{pdl}_max_power (state en VA, attributs kVA, date, heure, taux de charge, historique 31j)
+        - binary_sensor.myelectricaldata_linky_{pdl}_max_power_over (alerte problème si dépassement de la puissance souscrite)
+        """
+        from ...models.pdl import PDL
+
+        today = date.today()
+        yesterday = today - timedelta(days=1)
+        device = self._get_device_linky(pdl)
+
+        pdl_result = await db.execute(
+            select(PDL.subscribed_power).where(PDL.usage_point_id == pdl)
+        )
+        subscribed_power_kva = pdl_result.scalar_one_or_none()
+
+        # Récupérer l'historique des 31 derniers jours
+        history_start = today - timedelta(days=31)
+        mp_history = await stats.get_max_power_history(pdl, history_start, yesterday)
+
+        # Jour le plus récent
+        latest_date = yesterday if yesterday in mp_history else (max(mp_history.keys()) if mp_history else None)
+
+        if not latest_date or latest_date not in mp_history:
+            # Repli sur get_max_power_day (qui replie sur la courbe 30min si nécessaire)
+            kva, event_time = await stats.get_max_power_day(pdl, yesterday, "consumption")
+            if kva > 0:
+                va = int(round(kva * 1000))
+                latest_date = yesterday
+            else:
+                logger.debug(f"[HA-MQTT] Pas de données de puissance max pour PDL {pdl}")
+                return 0
+        else:
+            va = mp_history[latest_date]["va"]
+            kva = mp_history[latest_date]["kva"]
+            event_time = mp_history[latest_date]["time"]
+
+        is_over = (kva > subscribed_power_kva) if subscribed_power_kva else False
+        ratio_percent = round((kva / subscribed_power_kva) * 100, 1) if subscribed_power_kva else None
+
+        history_va = {d.isoformat(): data["va"] for d, data in sorted(mp_history.items())}
+        history_kva = {d.isoformat(): data["kva"] for d, data in sorted(mp_history.items())}
+
+        count = 0
+
+        # Capteur principal : puissance max (VA)
+        await self._publish_sensor_old_format(
+            client,
+            topic=f"myelectricaldata_max_power/{pdl}",
+            name="max power",
+            unique_id=f"myelectricaldata_linky_{pdl}_max_power",
+            device=device,
+            state=va,
+            attributes={
+                "pdl": pdl,
+                "date": latest_date.isoformat(),
+                "event_time": event_time,
+                "value_va": va,
+                "value_kva": kva,
+                "subscribed_power_kva": subscribed_power_kva,
+                "is_over_subscribed": is_over,
+                "load_ratio_percent": ratio_percent,
+                "history_va": history_va,
+                "history_kva": history_kva,
+                "last_updated": datetime.now().isoformat(),
+            },
+            unit="VA",
+            device_class="apparent_power",
+            state_class="measurement",
+            icon="mdi:gauge",
+        )
+        count += 1
+
+        # Capteur binaire : dépassement puissance souscrite
+        if subscribed_power_kva:
+            await self._publish_binary_sensor(
+                client,
+                unique_id=f"myelectricaldata_linky_{pdl}_max_power_over",
+                name="max power over subscribed",
+                state_topic=f"{self.discovery_prefix}/binary_sensor/myelectricaldata_max_power_over/{pdl}/state",
+                is_on=is_over,
+                attributes={
+                    "pdl": pdl,
+                    "date": latest_date.isoformat(),
+                    "value_kva": kva,
+                    "value_va": va,
+                    "subscribed_power_kva": subscribed_power_kva,
+                    "load_ratio_percent": ratio_percent,
+                    "last_updated": datetime.now().isoformat(),
+                },
+                device=device,
+                device_class="problem",
+                icon="mdi:flash-alert" if is_over else "mdi:flash-check",
+            )
+            count += 1
+
+        return count
+
     async def _export_production_stats(
         self,
         client: aiomqtt.Client,
@@ -1208,9 +1322,23 @@ class HomeAssistantExporter(BaseExporter):
         # Calculer HP/HC et max power pour chaque jour
         daily_hp: dict[date, int] = {}   # Wh
         daily_hc: dict[date, int] = {}   # Wh
-        daily_mp: dict[date, float] = {}  # kW
+        daily_mp: dict[date, float] = {}  # kW / kVA
         daily_mp_time: dict[date, str | None] = {}
         daily_mp_over: dict[date, bool] = {}
+
+        # Récupérer d'abord l'historique réel MaxPowerData (valeurs précises en VA / kVA)
+        if direction == "consumption":
+            mp_history = await stats.get_max_power_history(
+                pdl, yesterday - timedelta(days=nb_days - 1), yesterday
+            )
+            for mp_date, mp_data in mp_history.items():
+                daily_mp[mp_date] = mp_data["kva"]
+                daily_mp_time[mp_date] = mp_data["time"]
+                daily_mp_over[mp_date] = (
+                    mp_data["kva"] > subscribed_power_kva
+                    if subscribed_power_kva
+                    else False
+                )
 
         for day_date, intervals in detailed_by_day.items():
             hp_wh = 0
@@ -1237,13 +1365,15 @@ class HomeAssistantExporter(BaseExporter):
 
             daily_hp[day_date] = int(hp_wh)
             daily_hc[day_date] = int(hc_wh)
-            daily_mp[day_date] = round(max_power_kw, 2)
-            daily_mp_time[day_date] = max_time
-            daily_mp_over[day_date] = (
-                max_power_kw > subscribed_power_kva
-                if subscribed_power_kva
-                else False
-            )
+            # Ne pas écraser si déjà renseigné via MaxPowerData réel
+            if day_date not in daily_mp:
+                daily_mp[day_date] = round(max_power_kw, 2)
+                daily_mp_time[day_date] = max_time
+                daily_mp_over[day_date] = (
+                    max_power_kw > subscribed_power_kva
+                    if subscribed_power_kva
+                    else False
+                )
 
         # =====================================================================
         # ATTRIBUTS "HIER" (= dernier jour avec des données)
@@ -1443,12 +1573,13 @@ class HomeAssistantExporter(BaseExporter):
                     costs_newest.append("-1")
 
             # Puissance max
-            if has_detailed and day in daily_mp:
+            if day in daily_mp:
                 mp_newest.append(str(daily_mp[day]))
                 mp_over_newest.append(str(daily_mp_over[day]).lower())
                 if daily_mp_time[day]:
+                    time_str = daily_mp_time[day]
                     mp_time_newest.append(
-                        f"{day.isoformat()}T{daily_mp_time[day]}:00"
+                        f"{day.isoformat()}T{time_str}" if len(time_str) >= 8 else f"{day.isoformat()}T{time_str}:00"
                     )
                 else:
                     mp_time_newest.append("-1")

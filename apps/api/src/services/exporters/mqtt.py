@@ -169,6 +169,39 @@ class MQTTExporter(BaseExporter):
         logger.info(f"[MQTT] Published {len(data)} {granularity} production records for {usage_point_id}")
         return len(data)
 
+    async def export_max_power(
+        self,
+        usage_point_id: str,
+        data: list[dict[str, Any]],
+    ) -> int:
+        """Export daily maximum power data
+
+        Args:
+            usage_point_id: PDL number
+            data: List of max power records
+
+        Returns:
+            Number of records exported
+        """
+        if not data:
+            return 0
+
+        topic = f"{self.topic_prefix}/{usage_point_id}/power/daily"
+        payload = json.dumps({
+            "pdl": usage_point_id,
+            "granularity": "daily",
+            "unit": "VA",
+            "records": len(data),
+            "data": data,
+            "timestamp": datetime.now().isoformat(),
+        })
+
+        async with await self._get_mqtt_client() as client:
+            await client.publish(topic, payload=payload, qos=self.qos, retain=self.retain)
+
+        logger.info(f"[MQTT] Published {len(data)} max power records for {usage_point_id}")
+        return len(data)
+
     async def run_full_export(
         self,
         db: AsyncSession,
@@ -224,6 +257,18 @@ class MQTTExporter(BaseExporter):
                             retain=self.retain,
                         )
                         results["production"] += 1
+
+                    # Export max power stats
+                    mp_stats = await self._get_max_power_stats(db, pdl)
+                    if mp_stats:
+                        topic = f"{self.topic_prefix}/{pdl}/power/stats"
+                        await client.publish(
+                            topic,
+                            payload=json.dumps(mp_stats),
+                            qos=self.qos,
+                            retain=self.retain,
+                        )
+                        results["max_power"] = results.get("max_power", 0) + 1
 
                 except Exception as e:
                     logger.error(f"[MQTT] Error exporting PDL {pdl}: {e}")
@@ -287,6 +332,40 @@ class MQTTExporter(BaseExporter):
             )
 
         return results
+
+    async def _get_max_power_stats(self, db: AsyncSession, pdl: str) -> dict[str, Any] | None:
+        """Get max power statistics for a PDL"""
+        from ...services.statistics import StatisticsService
+        from ...models.pdl import PDL
+
+        stats = StatisticsService(db)
+        today = date.today()
+        yesterday = today - timedelta(days=1)
+
+        pdl_result = await db.execute(
+            select(PDL.subscribed_power).where(PDL.usage_point_id == pdl)
+        )
+        subscribed_power_kva = pdl_result.scalar_one_or_none()
+
+        history = await stats.get_max_power_history(pdl, today - timedelta(days=31), yesterday)
+        if not history:
+            return None
+
+        latest_date = yesterday if yesterday in history else max(history.keys())
+        latest = history[latest_date]
+
+        return {
+            "pdl": pdl,
+            "date": latest_date.isoformat(),
+            "event_time": latest["time"],
+            "value_va": latest["va"],
+            "value_kva": latest["kva"],
+            "subscribed_power_kva": subscribed_power_kva,
+            "is_over_subscribed": (latest["kva"] > subscribed_power_kva) if subscribed_power_kva else False,
+            "load_ratio_percent": round((latest["kva"] / subscribed_power_kva) * 100, 1) if subscribed_power_kva else None,
+            "history": {d.isoformat(): v["va"] for d, v in sorted(history.items())},
+            "history_kva": {d.isoformat(): v["kva"] for d, v in sorted(history.items())},
+        }
 
     async def _get_consumption_stats(self, db: AsyncSession, pdl: str) -> dict[str, Any] | None:
         """Get consumption statistics for a PDL"""

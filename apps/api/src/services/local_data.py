@@ -24,6 +24,7 @@ from ..services.enedis_contract import offpeak_hours_to_text, parse_address, par
 from ..models.client_mode import (
     ConsumptionData,
     ProductionData,
+    MaxPowerData,
     ContractData,
     AddressData,
     DataGranularity,
@@ -104,6 +105,84 @@ class LocalDataService:
             end_date=end_date,
             granularity=DataGranularity.DETAILED,
         )
+
+    async def get_max_power(
+        self,
+        usage_point_id: str,
+        start_date: date,
+        end_date: date,
+    ) -> tuple[list[dict[str, Any]], list[tuple[date, date]]]:
+        """Get daily max power from local database.
+
+        Returns:
+            Tuple of:
+            - List of max power records found locally (formatted as points with v, d)
+            - List of (start, end) date ranges missing locally
+        """
+        result = await self.db.execute(
+            select(MaxPowerData)
+            .where(
+                and_(
+                    MaxPowerData.usage_point_id == usage_point_id,
+                    MaxPowerData.date >= start_date,
+                    MaxPowerData.date < end_date,  # end_date is exclusive
+                )
+            )
+            .order_by(MaxPowerData.date)
+        )
+        records = result.scalars().all()
+
+        formatted = [
+            {
+                "v": str(rec.value),
+                "d": f"{rec.date.isoformat()} {rec.event_time}" if rec.event_time and " " not in rec.event_time else (rec.event_time or rec.date.isoformat()),
+            }
+            for rec in records
+        ]
+
+        # Find missing date ranges
+        result_dates = await self.db.execute(
+            select(func.distinct(MaxPowerData.date)).where(
+                and_(
+                    MaxPowerData.usage_point_id == usage_point_id,
+                    MaxPowerData.date >= start_date,
+                    MaxPowerData.date < end_date,
+                )
+            )
+        )
+        existing_dates = {row[0] for row in result_dates.fetchall()}
+
+        all_dates = set()
+        current = start_date
+        while current < end_date:
+            all_dates.add(current)
+            current += timedelta(days=1)
+
+        missing_dates = sorted(all_dates - existing_dates)
+        missing_ranges: list[tuple[date, date]] = []
+        if missing_dates:
+            range_start = missing_dates[0]
+            range_end = missing_dates[0]
+            for d in missing_dates[1:]:
+                if d == range_end + timedelta(days=1):
+                    range_end = d
+                else:
+                    missing_ranges.append((range_start, range_end + timedelta(days=1)))
+                    range_start = d
+                    range_end = d
+            missing_ranges.append((range_start, range_end + timedelta(days=1)))
+
+        if formatted:
+            logger.info(
+                f"[{usage_point_id}] Found {len(formatted)} local max power records "
+                f"from {start_date} to {end_date}"
+            )
+        if missing_ranges:
+            logger.info(
+                f"[{usage_point_id}] Missing {len(missing_ranges)} date ranges for max power: {missing_ranges}"
+            )
+
+        return formatted, missing_ranges
 
     async def get_contract(self, usage_point_id: str) -> dict[str, Any] | None:
         """Get contract data from local database."""
@@ -459,6 +538,21 @@ def format_detail_response(
     """Courbe de charge (W) au format Data Connect 2026."""
     response = build_measure(
         usage_point_id, start, end, readings, grandeur_metier=grandeur_metier, grandeur_physique="PA", unite="W"
+    )
+    response["_from_local_cache"] = from_cache
+    return response
+
+
+def format_max_power_response(
+    usage_point_id: str,
+    start: str,
+    end: str,
+    readings: list[dict[str, Any]],
+    from_cache: bool = False,
+) -> dict[str, Any]:
+    """Mesures de puissance maximale quotidienne (VA) au format Data Connect 2026."""
+    response = build_measure(
+        usage_point_id, start, end, readings, grandeur_metier="CONS", grandeur_physique="PMA", unite="VA", pas="P1D"
     )
     response["_from_local_cache"] = from_cache
     return response

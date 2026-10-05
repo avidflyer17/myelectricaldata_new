@@ -26,6 +26,7 @@ from ..models.client_mode import (
     ConsumptionData,
     ContractData,
     DataGranularity,
+    MaxPowerData,
     ProductionData,
     SyncStatus,
     SyncStatusType,
@@ -196,6 +197,7 @@ class SyncService:
                 "usage_point_id": usage_point_id,
                 "consumption_daily": "skipped (inactive PDL)",
                 "consumption_detail": "skipped (inactive PDL)",
+                "max_power": "skipped (inactive PDL)",
                 "production_daily": "skipped (inactive PDL)",
                 "production_detail": "skipped (inactive PDL)",
                 "contract": "skipped (inactive PDL)",
@@ -206,6 +208,7 @@ class SyncService:
             "usage_point_id": usage_point_id,
             "consumption_daily": None,
             "consumption_detail": None,
+            "max_power": None,
             "production_daily": None,
             "production_detail": None,
             "contract": None,
@@ -241,6 +244,14 @@ class SyncService:
         except Exception as e:
             logger.warning(f"[SYNC] Failed to sync consumption detail for {usage_point_id}: {e}")
             result["consumption_detail"] = f"error: {e}"
+
+        # Sync max power data
+        try:
+            mp_count = await self._sync_max_power(usage_point_id)
+            result["max_power"] = f"synced {mp_count} days"
+        except Exception as e:
+            logger.warning(f"[SYNC] Failed to sync max power for {usage_point_id}: {e}")
+            result["max_power"] = f"error: {e}"
 
         # Sync production data only if PDL has production
         pdl_result = await self.db.execute(
@@ -375,6 +386,229 @@ class SyncService:
             fetch_func=self.adapter.get_consumption_detail,
             model_class=ConsumptionData,
         )
+
+    async def _sync_max_power(self, usage_point_id: str) -> int:
+        """Sync daily maximum power data
+
+        Returns:
+            Number of records synced
+        """
+        sync_status = await self._get_or_create_sync_status(
+            usage_point_id, "max_power", DataGranularity.DAILY
+        )
+
+        end_date = date.today() - timedelta(days=1)
+        start_date = end_date - timedelta(days=MAX_DAILY_DAYS)
+
+        missing_ranges = await self._find_missing_max_power_ranges(
+            usage_point_id, start_date, end_date
+        )
+
+        if not missing_ranges:
+            logger.debug(
+                f"[SYNC] max_power complet pour {usage_point_id}, aucune donnée manquante"
+            )
+            return 0
+
+        logger.info(
+            f"[SYNC] max_power pour {usage_point_id}: "
+            f"{len(missing_ranges)} plage(s) manquante(s) détectée(s)"
+        )
+
+        sync_status.status = SyncStatusType.RUNNING
+        sync_status.last_sync_at = datetime.now(UTC)
+        await self.db.commit()
+
+        total_synced = 0
+        errors = []
+
+        try:
+            chunk_size = 365
+            for range_start, range_end in missing_ranges:
+                current_start = range_start
+                while current_start < range_end:
+                    current_end = min(
+                        current_start + timedelta(days=chunk_size),
+                        range_end,
+                    )
+
+                    try:
+                        response = await self.adapter.get_consumption_max_power(
+                            usage_point_id,
+                            current_start.isoformat(),
+                            current_end.isoformat(),
+                        )
+
+                        records = self._parse_max_power_reading(
+                            response, usage_point_id
+                        )
+                        if records:
+                            await self._upsert_max_power_records(records)
+                            total_synced += len(records)
+
+                    except Exception as e:
+                        await self.db.rollback()
+                        logger.warning(
+                            f"[SYNC] Erreur fetch max_power pour {usage_point_id} "
+                            f"({current_start} - {current_end}): {e}"
+                        )
+                        errors.append(str(e))
+
+                    current_start = current_end
+
+            if errors:
+                sync_status.status = SyncStatusType.PARTIAL
+                sync_status.error_message = "; ".join(errors[:5])
+                sync_status.error_count += len(errors)
+            else:
+                sync_status.status = SyncStatusType.SUCCESS
+                sync_status.error_message = None
+
+            sync_status.records_synced_last_run = total_synced
+            sync_status.total_records += total_synced
+
+            if total_synced > 0:
+                if not sync_status.oldest_data_date or start_date < sync_status.oldest_data_date:
+                    sync_status.oldest_data_date = start_date
+                sync_status.newest_data_date = end_date
+
+            sync_status.next_sync_at = datetime.now(UTC) + timedelta(minutes=30)
+            await self.db.commit()
+
+            logger.info(
+                f"[SYNC] max_power pour {usage_point_id}: "
+                f"{total_synced} enregistrements synchronisés"
+            )
+
+        except Exception as e:
+            await self.db.rollback()
+            sync_status.status = SyncStatusType.FAILED
+            sync_status.error_message = str(e)
+            sync_status.error_count += 1
+            sync_status.last_error_at = datetime.now(UTC)
+            await self.db.commit()
+            raise
+
+        return total_synced
+
+    async def _find_missing_max_power_ranges(
+        self,
+        usage_point_id: str,
+        start_date: date,
+        end_date: date,
+    ) -> list[tuple[date, date]]:
+        """Détecte les dates manquantes dans max_power_data"""
+        result = await self.db.execute(
+            select(func.distinct(MaxPowerData.date)).where(
+                and_(
+                    MaxPowerData.usage_point_id == usage_point_id,
+                    MaxPowerData.date >= start_date,
+                    MaxPowerData.date < end_date,
+                )
+            )
+        )
+        existing_dates = {row[0] for row in result.fetchall()}
+
+        all_dates = set()
+        current = start_date
+        while current < end_date:
+            all_dates.add(current)
+            current += timedelta(days=1)
+
+        missing_dates = sorted(all_dates - existing_dates)
+        if not missing_dates:
+            return []
+
+        ranges: list[tuple[date, date]] = []
+        range_start = missing_dates[0]
+        range_end = missing_dates[0]
+
+        for d in missing_dates[1:]:
+            if d == range_end + timedelta(days=1):
+                range_end = d
+            else:
+                ranges.append((range_start, range_end + timedelta(days=1)))
+                range_start = d
+                range_end = d
+
+        ranges.append((range_start, range_end + timedelta(days=1)))
+        return ranges
+
+    def _parse_max_power_reading(
+        self,
+        response: dict[str, Any],
+        usage_point_id: str,
+    ) -> list[dict[str, Any]]:
+        """Parse max power reading response into records"""
+        records = []
+
+        for reading in extract_points(_unwrap(response)):
+            date_str = reading.get("d", "")
+            value = reading.get("v")
+
+            if not date_str or value is None:
+                continue
+
+            try:
+                if "T" in date_str or " " in date_str:
+                    if "T" in date_str:
+                        dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                    else:
+                        dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+                    record_date = dt.date()
+                    event_time = dt.strftime("%H:%M:%S")
+                else:
+                    record_date = date.fromisoformat(date_str)
+                    event_time = None
+            except ValueError as e:
+                logger.warning(f"[SYNC] Failed to parse max power date '{date_str}': {e}")
+                continue
+
+            records.append({
+                "usage_point_id": usage_point_id,
+                "date": record_date,
+                "value": int(value),
+                "event_time": event_time,
+                "source": "myelectricaldata",
+                "raw_data": reading,
+            })
+
+        return records
+
+    async def _upsert_max_power_records(
+        self,
+        records: list[dict[str, Any]],
+    ) -> None:
+        """Upsert max power records using PostgreSQL ON CONFLICT"""
+        if not records:
+            return
+
+        seen: dict[tuple, int] = {}
+        for idx, record in enumerate(records):
+            key = (record["usage_point_id"], record["date"])
+            seen[key] = idx
+
+        if len(seen) < len(records):
+            logger.debug(
+                f"[SYNC] Dédupliqué {len(records) - len(seen)} enregistrements max_power en double"
+            )
+        records = [records[i] for i in sorted(seen.values())]
+
+        stmt = pg_insert(MaxPowerData).values(records)
+        stmt = stmt.on_conflict_do_update(
+            constraint="uq_max_power_data",
+            set_={
+                "value": stmt.excluded.value,
+                "event_time": stmt.excluded.event_time,
+                "source": stmt.excluded.source,
+                "raw_data": stmt.excluded.raw_data,
+                "updated_at": datetime.now(UTC),
+            },
+        )
+
+        await self.db.execute(stmt)
+        await self.db.commit()
+
 
     async def _sync_production_daily(self, usage_point_id: str) -> int:
         """Sync daily production data"""
