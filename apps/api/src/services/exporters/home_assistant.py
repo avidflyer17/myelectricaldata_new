@@ -853,10 +853,10 @@ class HomeAssistantExporter(BaseExporter):
             **attributes,
         }
 
-        # Format: homeassistant/binary_sensor/{node_id}/{object_id}/config
-        object_id = unique_id.replace(f"{self.prefix}_", "", 1) if unique_id.startswith(f"{self.prefix}_") else unique_id
+        # Format: {discovery_prefix}/binary_sensor/{topic}/config
+        config_topic = state_topic.removesuffix("/state") + "/config"
         await client.publish(
-            f"{self.discovery_prefix}/binary_sensor/{self.prefix}/{object_id}/config",
+            config_topic,
             payload=json.dumps(discovery_config),
             retain=True,
         )
