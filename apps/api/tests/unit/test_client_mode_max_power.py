@@ -127,7 +127,7 @@ class TestHomeAssistantMaxPowerSensor:
         }
 
         exporter = HomeAssistantExporter(
-            config={"mqtt_enabled": True, "prefix": "myelectricaldata"}
+            config={"mqtt_enabled": True, "mqtt_broker": "localhost", "prefix": "myelectricaldata"}
         )
 
         with patch.object(exporter, "_publish_sensor_old_format", new_callable=AsyncMock) as mock_pub_sensor, \
