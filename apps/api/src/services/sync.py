@@ -596,6 +596,7 @@ class SyncService:
         total_synced = 0
         rate_limited = False
         rate_limit_msg = None
+        errors: list[str] = []
 
         for range_start, range_end in missing_ranges:
             if rate_limited:
